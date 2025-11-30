@@ -1,0 +1,240 @@
+import os
+import torch
+import pandas as pd
+import numpy as np
+from PIL import Image
+from tqdm.auto import tqdm
+from diffusers import StableDiffusionControlNetPipeline, ControlNetModel, UniPCMultistepScheduler
+
+# Metrics libraries (指标计算库)
+from torchmetrics.image import StructuralSimilarityIndexMeasure, PeakSignalNoiseRatio, LearnedPerceptualImagePatchSimilarity
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchvision.io import read_image
+
+# ==========================================
+# 1. Configuration (配置区域)
+# ==========================================
+# Path to your BEST checkpoint
+# 模型路径：根据你之前的“视觉测试”，如果觉得 Epoch 8 最好，就把下面的 10 改成 8
+CHECKPOINT_PATH = "./sat2street_output/checkpoint-epoch-10" 
+
+# Dataset paths
+# 数据路径 (自动判断 Notebook 位置)
+if os.path.exists("pairs.csv"):
+    DATA_ROOT = "." 
+else:
+    DATA_ROOT = "./data"
+
+CSV_PATH = os.path.join(DATA_ROOT, "pairs.csv")
+IMAGE_DIR = os.path.join(DATA_ROOT, "images")
+
+# 🔥 Output directory (结果保存到 D 盘) 🔥
+# 使用 r"..." 防止路径转义错误
+EVAL_ROOT = r"D:\yifan_2025\evaluation_results"
+
+# Number of samples per category
+# 每个分类测试多少张？(建议 50 以保证 FID 有效，显卡好可以设为 None 跑全量)
+SAMPLES_PER_CATEGORY = 50 
+
+# ==========================================
+# 2. Setup Metrics (初始化指标工具)
+# ==========================================
+print("⚙️ Initializing metrics calculators (初始化评估指标)...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Initialize metrics on GPU to speed up
+# 在 GPU 上初始化 SSIM, PSNR, LPIPS, FID
+ssim_calc = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+psnr_calc = PeakSignalNoiseRatio(data_range=1.0).to(device)
+lpips_calc = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
+# FID 需要较多显存，如果爆显存可以将 feature 改为 64
+fid_calc = FrechetInceptionDistance(feature=2048).to(device)
+
+# ==========================================
+# 3. Load Model (加载模型)
+# ==========================================
+print(f"🚀 Loading model from: {CHECKPOINT_PATH}")
+try:
+    controlnet = ControlNetModel.from_pretrained(CHECKPOINT_PATH, torch_dtype=torch.float16)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", 
+        controlnet=controlnet, 
+        torch_dtype=torch.float16, 
+        safety_checker=None
+    ).to(device)
+    pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+    # CPU Offload saves VRAM for metric calculation
+    # 开启 CPU 卸载以节省显存给指标计算使用
+    pipe.enable_model_cpu_offload()
+except Exception as e:
+    print(f"❌ Failed to load model. Error: {e}")
+    exit()
+
+# ==========================================
+# 4. Evaluation Loop (主评估循环)
+# ==========================================
+def evaluate_and_calculate():
+    # Create results folder
+    # 创建结果文件夹
+    if not os.path.exists(EVAL_ROOT):
+        os.makedirs(EVAL_ROOT, exist_ok=True)
+    
+    # Read CSV
+    df = pd.read_csv(CSV_PATH)
+    severities = df['severity'].unique()
+    
+    final_results = []
+
+    # Iterate through each severity category
+    # 遍历每一个灾害等级
+    for severity in severities:
+        print(f"\n{'='*40}")
+        print(f"🧐 Processing Category: {severity}")
+        print(f"{'='*40}")
+        
+        # Create temp folders for FID calculation (Required by torch-fidelity)
+        # 为 FID 计算创建临时文件夹 (必须保存成文件才能算 FID)
+        cat_gen_dir = os.path.join(EVAL_ROOT, severity, "generated")
+        cat_gt_dir = os.path.join(EVAL_ROOT, severity, "ground_truth")
+        os.makedirs(cat_gen_dir, exist_ok=True)
+        os.makedirs(cat_gt_dir, exist_ok=True)
+
+        # Filter data
+        # 筛选数据
+        cat_df = df[df['severity'] == severity]
+        if SAMPLES_PER_CATEGORY:
+            n_sample = min(SAMPLES_PER_CATEGORY, len(cat_df))
+            cat_df = cat_df.sample(n_sample, random_state=42)
+        
+        # Storage for scores
+        scores = {"ssim": [], "psnr": [], "lpips": []}
+        
+        # Reset FID for this category
+        # 重置 FID 计算器
+        fid_calc.reset()
+
+        # Loop through samples
+        # 遍历样本
+        for idx, row in tqdm(cat_df.iterrows(), total=len(cat_df), desc="Generating & Measuring"):
+            try:
+                # 1. Load Images
+                # 读取图片
+                sat_name = os.path.basename(row["sat_path"])
+                svi_name = os.path.basename(row["svi_path"])
+                
+                sat_path = os.path.join(IMAGE_DIR, sat_name)
+                gt_path = os.path.join(IMAGE_DIR, svi_name)
+                
+                if not os.path.exists(sat_path) or not os.path.exists(gt_path):
+                    continue
+
+                sat_img = Image.open(sat_path).convert("RGB")
+                gt_img = Image.open(gt_path).convert("RGB")
+                
+                # 2. Get Original Dimensions
+                # [关键] 获取真实图片的原始尺寸 (为了后面还原)
+                orig_w, orig_h = gt_img.size
+                
+                # 3. Generate
+                # 生成 (输入先缩放到 512x512 喂给模型)
+                input_sat = sat_img.resize((512, 512), Image.BICUBIC)
+                prompt = f"street view photography, realistic, ground level view, {str(severity).replace('_', ' ').lower()}, high quality, 4k"
+                
+                with torch.inference_mode():
+                    gen_img = pipe(
+                        prompt, 
+                        image=input_sat, 
+                        num_inference_steps=20,
+                        controlnet_conditioning_scale=1.0
+                    ).images[0]
+                
+                # 4. Resize back to Original Size
+                # [关键] 还原尺寸：强制拉伸回原始大小，确保和 GT 一致
+                gen_img = gen_img.resize((orig_w, orig_h), Image.LANCZOS)
+                
+                # 5. Save to disk
+                # 保存图片 (FID 计算需要读取这些文件)
+                save_name = f"{idx}.png"
+                gen_save_path = os.path.join(cat_gen_dir, save_name)
+                gt_save_path = os.path.join(cat_gt_dir, save_name)
+                gen_img.save(gen_save_path)
+                gt_img.save(gt_save_path)
+                
+                # 6. Calculate Metrics (Pair-wise)
+                # 计算成对指标 (需要转为 Tensor 并归一化)
+                gen_tensor = read_image(gen_save_path).float() / 255.0
+                gt_tensor = read_image(gt_save_path).float() / 255.0
+                
+                # Add batch dimension
+                gen_tensor = gen_tensor.unsqueeze(0).to(device)
+                gt_tensor = gt_tensor.unsqueeze(0).to(device)
+                
+                # Calculate SSIM, PSNR
+                scores["ssim"].append(ssim_calc(gen_tensor, gt_tensor).item())
+                scores["psnr"].append(psnr_calc(gen_tensor, gt_tensor).item())
+                
+                # Calculate LPIPS (Requires input in range [-1, 1])
+                # LPIPS 需要输入范围在 [-1, 1]
+                scores["lpips"].append(lpips_calc(gen_tensor * 2.0 - 1.0, gt_tensor * 2.0 - 1.0).item())
+                
+                # Update FID (Distribution-wise)
+                # 更新 FID 统计数据 (需要 uint8 格式)
+                gen_uint8 = read_image(gen_save_path).unsqueeze(0).to(device)
+                gt_uint8 = read_image(gt_save_path).unsqueeze(0).to(device)
+                fid_calc.update(gt_uint8, real=True)
+                fid_calc.update(gen_uint8, real=False)
+                
+            except Exception as e:
+                print(f"⚠️ Error processing {sat_name}: {e}")
+                continue
+
+        # Compute Final FID for this category
+        # 计算该类别的 FID 分数
+        try:
+            fid_score = fid_calc.compute().item()
+        except Exception:
+            print("⚠️ Not enough samples for FID, setting to NaN")
+            fid_score = float('nan')
+
+        # Store Results
+        # 保存该类别的平均结果
+        final_results.append({
+            "Category": severity,
+            "SSIM ↑": np.mean(scores["ssim"]),
+            "PSNR ↑": np.mean(scores["psnr"]),
+            "LPIPS ↓": np.mean(scores["lpips"]),
+            "FID ↓": fid_score
+        })
+
+    # ==========================================
+    # 5. Final Report (生成最终报告)
+    # ==========================================
+    if not final_results:
+        print("❌ No results generated. Check your paths.")
+        return
+
+    df_res = pd.DataFrame(final_results)
+    
+    # Calculate Average across all categories
+    # 计算所有类别的平均值
+    avg_row = df_res.mean(numeric_only=True).to_dict()
+    avg_row["Category"] = "AVERAGE"
+    df_res = pd.concat([df_res, pd.DataFrame([avg_row])], ignore_index=True)
+    
+    # Format columns
+    df_res = df_res[["Category", "SSIM ↑", "PSNR ↑", "FID ↓", "LPIPS ↓"]]
+
+    print("\n" + "="*60)
+    print("🏆 FINAL EVALUATION METRICS (最终评估结果)")
+    print("="*60)
+    print(df_res.round(4).to_string(index=False))
+    print("="*60)
+    
+    # Save CSV to D drive
+    # 保存 CSV 文件
+    save_csv = os.path.join(EVAL_ROOT, "final_metrics.csv")
+    df_res.to_csv(save_csv, index=False)
+    print(f"\n✅ All results saved to: {EVAL_ROOT}")
+
+if __name__ == "__main__":
+    evaluate_and_calculate()
