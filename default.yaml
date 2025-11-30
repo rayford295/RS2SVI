@@ -1,6 +1,0 @@
-# Default configuration for RS2SVI project
-experiment:
-  name: default
-  data_path: data/sample
-  model: baseline
-  epochs: 1
