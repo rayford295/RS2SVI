@@ -1,0 +1,262 @@
+import os
+import pandas as pd
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm.auto import tqdm
+from torchvision.utils import save_image
+
+# ==========================================
+# 1. 核心配置 (Config)
+# ==========================================
+CONFIG = {
+    "epoch": 0,
+    "n_epochs": 100,           # 训练轮数
+    "batch_size": 4,           # 显存够大可改 8
+    "lr": 0.0002,
+    "b1": 0.5,
+    "b2": 0.999,
+    "img_size": 256,           # Pix2Pix 经典尺寸
+    "val_ratio": 0.1,          # 验证集比例
+    "lambda_pixel": 100,       # L1 Loss 权重
+    "output_dir": "./output_pix2pix",
+    "root_dir": "./"           # 你的数据根目录 (pairs.csv 所在位置)
+}
+
+# 创建输出文件夹
+os.makedirs(CONFIG["output_dir"], exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 2. 数据集类 (内置在同一个代码块里)
+# ==========================================
+class Sat2StreetDataset(Dataset):
+    def __init__(self, root_dir="./", resolution=256, split="train", val_ratio=0.1, model_type="gan"):
+        self.resolution = resolution
+        self.root_dir = root_dir
+        self.model_type = model_type
+        
+        # 1. 寻找 csv
+        csv_path = os.path.join(root_dir, "pairs.csv")
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"❌ 找不到 {csv_path}！请确认文件路径。")
+
+        # 2. 读取并打乱数据
+        df_all = pd.read_csv(csv_path)
+        
+        # 🔥 核心：固定随机种子 42，确保以后跑 Diffusion 对比时测试集完全一样 🔥
+        df_all = df_all.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+        # 3. 划分训练集和验证集
+        val_size = int(len(df_all) * val_ratio)
+        train_size = len(df_all) - val_size
+        
+        if split == "train":
+            self.df = df_all.iloc[:train_size]
+        else:
+            self.df = df_all.iloc[train_size:]
+            
+        print(f"✅ [{split.upper()}] Dataset Load: {len(self.df)} images.")
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        sat_name = os.path.basename(row["sat_path"])
+        svi_name = os.path.basename(row["svi_path"])
+        sat_path = os.path.join(self.root_dir, "images", sat_name)
+        svi_path = os.path.join(self.root_dir, "images", svi_name)
+
+        try:
+            # Resize
+            sat = Image.open(sat_path).convert("RGB").resize((self.resolution, self.resolution), Image.BICUBIC)
+            svi = Image.open(svi_path).convert("RGB").resize((self.resolution, self.resolution), Image.BICUBIC)
+        except Exception as e:
+            print(f"⚠️ Error loading {sat_path}: {e}")
+            sat = Image.new('RGB', (self.resolution, self.resolution))
+            svi = Image.new('RGB', (self.resolution, self.resolution))
+
+        # 归一化到 [-1, 1]
+        sat_t = torch.from_numpy(np.array(sat).astype(np.float32)).permute(2, 0, 1) / 127.5 - 1.0
+        svi_t = torch.from_numpy(np.array(svi).astype(np.float32)).permute(2, 0, 1) / 127.5 - 1.0
+
+        return {"A": sat_t, "B": svi_t} # A=Satellite, B=StreetView
+
+# ==========================================
+# 3. 模型定义 (Generator & Discriminator)
+# ==========================================
+def weights_init_normal(m):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        torch.nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find("BatchNorm2d") != -1:
+        torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+        torch.nn.init.constant_(m.bias.data, 0.0)
+
+class UNetDown(nn.Module):
+    def __init__(self, in_size, out_size, normalize=True, dropout=0.0):
+        super(UNetDown, self).__init__()
+        layers = [nn.Conv2d(in_size, out_size, 4, 2, 1, bias=False)]
+        if normalize:
+            layers.append(nn.InstanceNorm2d(out_size))
+        layers.append(nn.LeakyReLU(0.2))
+        if dropout:
+            layers.append(nn.Dropout(dropout))
+        self.model = nn.Sequential(*layers)
+    def forward(self, x): return self.model(x)
+
+class UNetUp(nn.Module):
+    def __init__(self, in_size, out_size, dropout=0.0):
+        super(UNetUp, self).__init__()
+        layers = [
+            nn.ConvTranspose2d(in_size, out_size, 4, 2, 1, bias=False),
+            nn.InstanceNorm2d(out_size),
+            nn.ReLU(inplace=True),
+        ]
+        if dropout: layers.append(nn.Dropout(dropout))
+        self.model = nn.Sequential(*layers)
+    def forward(self, x, skip_input):
+        x = self.model(x)
+        x = torch.cat((x, skip_input), 1)
+        return x
+
+class GeneratorUNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=3):
+        super(GeneratorUNet, self).__init__()
+        self.down1 = UNetDown(in_channels, 64, normalize=False)
+        self.down2 = UNetDown(64, 128)
+        self.down3 = UNetDown(128, 256)
+        self.down4 = UNetDown(256, 512, dropout=0.5)
+        self.down5 = UNetDown(512, 512, dropout=0.5)
+        self.down6 = UNetDown(512, 512, dropout=0.5)
+        self.down7 = UNetDown(512, 512, dropout=0.5)
+        self.down8 = UNetDown(512, 512, normalize=False, dropout=0.5)
+        self.up1 = UNetUp(512, 512, dropout=0.5)
+        self.up2 = UNetUp(1024, 512, dropout=0.5)
+        self.up3 = UNetUp(1024, 512, dropout=0.5)
+        self.up4 = UNetUp(1024, 512, dropout=0.5)
+        self.up5 = UNetUp(1024, 256)
+        self.up6 = UNetUp(512, 128)
+        self.up7 = UNetUp(256, 64)
+        self.final = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(128, out_channels, 4, padding=1),
+            nn.Tanh(),
+        )
+    def forward(self, x):
+        d1 = self.down1(x); d2 = self.down2(d1); d3 = self.down3(d2); d4 = self.down4(d3)
+        d5 = self.down5(d4); d6 = self.down6(d5); d7 = self.down7(d6); d8 = self.down8(d7)
+        u1 = self.up1(d8, d7); u2 = self.up2(u1, d6); u3 = self.up3(u2, d5); u4 = self.up4(u3, d4)
+        u5 = self.up5(u4, d3); u6 = self.up6(u5, d2); u7 = self.up7(u6, d1)
+        return self.final(u7)
+
+class Discriminator(nn.Module):
+    def __init__(self, in_channels=3):
+        super(Discriminator, self).__init__()
+        def discriminator_block(in_filters, out_filters, normalization=True):
+            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalization: layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+        self.model = nn.Sequential(
+            *discriminator_block(in_channels * 2, 64, normalization=False),
+            *discriminator_block(64, 128),
+            *discriminator_block(128, 256),
+            *discriminator_block(256, 512),
+            nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(512, 1, 4, padding=1, bias=False)
+        )
+    def forward(self, img_A, img_B):
+        img_input = torch.cat((img_A, img_B), 1)
+        return self.model(img_input)
+
+# ==========================================
+# 4. 训练主循环
+# ==========================================
+# 初始化模型
+print("🚀 初始化模型...")
+generator = GeneratorUNet().to(device)
+discriminator = Discriminator().to(device)
+generator.apply(weights_init_normal)
+discriminator.apply(weights_init_normal)
+
+# 优化器 & 损失
+optimizer_G = torch.optim.Adam(generator.parameters(), lr=CONFIG["lr"], betas=(CONFIG["b1"], CONFIG["b2"]))
+optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=CONFIG["lr"], betas=(CONFIG["b1"], CONFIG["b2"]))
+criterion_GAN = torch.nn.MSELoss()
+criterion_pixelwise = torch.nn.L1Loss()
+
+# 数据加载
+train_dataset = Sat2StreetDataset(root_dir=CONFIG["root_dir"], resolution=CONFIG["img_size"], split="train", val_ratio=CONFIG["val_ratio"])
+val_dataset = Sat2StreetDataset(root_dir=CONFIG["root_dir"], resolution=CONFIG["img_size"], split="val", val_ratio=CONFIG["val_ratio"])
+train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True, num_workers=0)
+val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
+
+print(f"🔥 开始训练! 结果将保存在: {CONFIG['output_dir']}")
+
+for epoch in range(CONFIG["n_epochs"]):
+    generator.train()
+    discriminator.train()
+    
+    tqdm_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{CONFIG['n_epochs']}")
+    
+    for i, batch in enumerate(tqdm_bar):
+        real_A = batch["A"].to(device)
+        real_B = batch["B"].to(device)
+
+        # ------------------
+        #  Train Generators
+        # ------------------
+        optimizer_G.zero_grad()
+        fake_B = generator(real_A)
+        
+        # PatchGAN labels
+        patch = (1, real_A.size(2) // 16, real_A.size(3) // 16)
+        valid = torch.ones((real_A.size(0), *patch), requires_grad=False).to(device)
+        fake = torch.zeros((real_A.size(0), *patch), requires_grad=False).to(device)
+
+        pred_fake = discriminator(fake_B, real_A)
+        loss_GAN = criterion_GAN(pred_fake, valid)
+        loss_pixel = criterion_pixelwise(fake_B, real_B)
+        loss_G = loss_GAN + CONFIG["lambda_pixel"] * loss_pixel
+        
+        loss_G.backward()
+        optimizer_G.step()
+
+        # ---------------------
+        #  Train Discriminator
+        # ---------------------
+        optimizer_D.zero_grad()
+        pred_real = discriminator(real_B, real_A)
+        loss_real = criterion_GAN(pred_real, valid)
+        pred_fake = discriminator(fake_B.detach(), real_A)
+        loss_fake = criterion_GAN(pred_fake, fake)
+        loss_D = 0.5 * (loss_real + loss_fake)
+        
+        loss_D.backward()
+        optimizer_D.step()
+
+        tqdm_bar.set_postfix(G=loss_G.item(), D=loss_D.item())
+
+    # --- 验证与保存 (每5轮) ---
+    if (epoch + 1) % 5 == 0:
+        generator.eval()
+        with torch.no_grad():
+            val_batch = next(iter(val_loader))
+            val_real_A = val_batch["A"].to(device)
+            val_real_B = val_batch["B"].to(device)
+            val_fake_B = generator(val_real_A)
+            
+            # 拼接: Input | Generated | GroundTruth
+            img_sample = torch.cat((val_real_A, val_fake_B, val_real_B), -1)
+            save_path = os.path.join(CONFIG["output_dir"], f"epoch_{epoch+1}.png")
+            save_image(img_sample, save_path, nrow=2, normalize=True)
+            print(f"🖼️ 验证图已保存: {save_path}")
+        
+        torch.save(generator.state_dict(), os.path.join(CONFIG["output_dir"], f"generator_epoch_{epoch+1}.pth"))
