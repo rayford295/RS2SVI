@@ -1,0 +1,151 @@
+import torch
+import torch.nn as nn
+from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler, ControlNetModel, UniPCMultistepScheduler
+from transformers import CLIPTextModel, CLIPTokenizer
+from PIL import Image
+import numpy as np
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==========================================
+# 复制你的模型类定义
+# ==========================================
+class SeverityAwareDiffusion(nn.Module):
+    def __init__(self, base_model_path):
+        super().__init__()
+        # 这里不需要重新加载预训练权重，我们稍后会覆盖它们
+        # 为了初始化结构，我们需要先实例化，但可以先加载空的或者标准的
+        self.text_encoder = CLIPTextModel.from_pretrained(base_model_path, subfolder="text_encoder")
+        self.vae = AutoencoderKL.from_pretrained(base_model_path, subfolder="vae")
+        self.unet = UNet2DConditionModel.from_pretrained(base_model_path, subfolder="unet")
+        self.controlnet = ControlNetModel.from_unet(self.unet)
+        
+        self.severity_embedding = nn.Embedding(num_embeddings=3, embedding_dim=768)
+        
+    def forward(self, pixel_values, conditioning_pixel_values, input_ids, severity_idx, noise, timesteps):
+        # 推理时这个 forward 其实用不到，我们会手写推理循环
+        # 但为了加载权重，这个结构必须存在
+        pass
+
+# ==========================================
+# 配置路径 (根据你截图中的实际路径修改)
+# ==========================================
+BASE_MODEL_ID = "runwayml/stable-diffusion-v1-5"
+
+# 🔍 修改处：根据你的截图，路径应指向 sat2street_model 里的 output_severity_diffusion
+CHECKPOINT_PATH = "/content/drive/MyDrive/sat2street_model/output_severity_diffusion/checkpoint_epoch_5" 
+
+print(f"📂 模型路径设置为: {CHECKPOINT_PATH}")
+
+print("⏳ 正在加载基础模型和 tokenizer...")
+tokenizer = CLIPTokenizer.from_pretrained(BASE_MODEL_ID, subfolder="tokenizer")
+scheduler = UniPCMultistepScheduler.from_pretrained(BASE_MODEL_ID, subfolder="scheduler") 
+
+print("⏳ 正在构建模型结构...")
+# 初始化模型结构
+model = SeverityAwareDiffusion(BASE_MODEL_ID).to(device)
+
+print("⏳ 正在加载训练好的权重...")
+# 1. 加载 UNet
+model.unet = UNet2DConditionModel.from_pretrained(f"{CHECKPOINT_PATH}/unet").to(device)
+# 2. 加载 ControlNet
+model.controlnet = ControlNetModel.from_pretrained(f"{CHECKPOINT_PATH}/controlnet").to(device)
+# 3. 加载 Severity Embedding
+model.severity_embedding.load_state_dict(torch.load(f"{CHECKPOINT_PATH}/severity_embedding.pth", map_location=device))
+
+model.eval()
+print("✅ 模型加载完成！")
+
+# ==========================================
+# 推理函数 (Inference Loop)
+# ==========================================
+@torch.no_grad()
+def generate_image(sat_image_path, severity_idx, prompt, steps=30, seed=42):
+    # 1. 预处理卫星图 (Control Image)
+    sat_img = Image.open(sat_image_path).convert("RGB").resize((512, 512))
+    # 转换为 Tensor: [1, 3, 512, 512] 范围 [-1, 1] (ControlNet 需要)
+    cond_image = torch.from_numpy(np.array(sat_img)).float() / 127.5 - 1.0
+    cond_image = cond_image.permute(2, 0, 1).unsqueeze(0).to(device)
+
+    # 2. 编码 Prompt
+    text_inputs = tokenizer(
+        prompt, padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
+    )
+    text_input_ids = text_inputs.input_ids.to(device)
+    encoder_hidden_states = model.text_encoder(text_input_ids)[0] # [1, 77, 768]
+
+    # 3. 注入 Severity Embedding (关键步骤！)
+    sev_idx_tensor = torch.tensor([severity_idx], device=device, dtype=torch.long)
+    sev_embeds = model.severity_embedding(sev_idx_tensor).unsqueeze(1) # [1, 1, 768]
+    # 拼接到 text embedding 前面 (与你训练时一致)
+    encoder_hidden_states = torch.cat([sev_embeds, encoder_hidden_states], dim=1) # [1, 78, 768]
+
+    # 4. 初始化 Latents (随机噪声)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    latents = torch.randn(
+        (1, model.unet.config.in_channels, 512 // 8, 512 // 8),
+        generator=generator,
+        device=device,
+        dtype=model.unet.dtype
+    )
+    latents = latents * scheduler.init_noise_sigma
+
+    # 5. 设置 Scheduler
+    scheduler.set_timesteps(steps)
+    
+    print("🎨 开始生成...")
+    for t in scheduler.timesteps:
+        # 扩展 latents 以适应 ControlNet 输入 (如果使用了 classifier-free guidance 需要复制，这里简化没用 guidance)
+        latent_model_input = scheduler.scale_model_input(latents, t)
+
+        # ControlNet 前向传播
+        down_block_res_samples, mid_block_res_sample = model.controlnet(
+            sample=latent_model_input,
+            timestep=t,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=cond_image,
+            return_dict=False,
+        )
+
+        # UNet 前向传播
+        noise_pred = model.unet(
+            sample=latent_model_input,
+            timestep=t,
+            encoder_hidden_states=encoder_hidden_states,
+            down_block_additional_residuals=down_block_res_samples,
+            mid_block_additional_residual=mid_block_res_sample,
+        ).sample
+
+        # Scheduler Step (去噪)
+        latents = scheduler.step(noise_pred, t, latents).prev_sample
+
+    # 6. 解码 Latents -> Image
+    image = model.vae.decode(latents / model.vae.config.scaling_factor, return_dict=False)[0]
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+    final_image = Image.fromarray((image[0] * 255).astype(np.uint8))
+    
+    return final_image, sat_img
+
+# 测试参数
+TEST_IMG_PATH = "/content/drive/MyDrive/sat2street_model/test dataset/004120_sat.png" # 你的测试卫星图路径
+SEVERITY_LEVEL = 2  # 0: Minor, 1: Moderate, 2: Severe
+PROMPT = "street view photo, SevereDamage, realistic, 4k"
+
+# 生成
+result_img, input_sat = generate_image(TEST_IMG_PATH, SEVERITY_LEVEL, PROMPT)
+
+# 显示对比
+import matplotlib.pyplot as plt
+
+fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+axs[0].imshow(input_sat)
+axs[0].set_title("Input Satellite")
+axs[0].axis("off")
+
+axs[1].imshow(result_img)
+axs[1].set_title(f"Generated (Severity {SEVERITY_LEVEL})")
+axs[1].axis("off")
+
+plt.show()
