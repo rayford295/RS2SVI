@@ -10,6 +10,11 @@
 
 > Accepted at **IEEE IGARSS 2026**
 
+## Updates
+
+- The IGARSS 2026 technical program scheduled our paper, “Satellite-to-Street: Synthesizing Post-Disaster Views from Satellite Imagery via Generative Vision Models,” as **Paper TH3.R6.4** in **Session TH3.R6**, with presentation time **Thursday, August 13, 2026, 14:30–14:45** in **Washington, D.C.**
+- Yifan Yang received the **2026 IEEE GRSS Travel Grant** for **IGARSS 2026, Washington, D.C.** in the amount of **$500**.
+
 ---
 
 ## Overview
